@@ -153,6 +153,11 @@ void route_load(geo_pos2_t start_pos, double start_hdg, list_t *segs);
 
 route_t *route_alloc(avl_tree_t *route_table, const list_t *segs);
 void route_free(route_t *r);
+void route_seg_append(avl_tree_t *route_table, route_t *r, const seg_t *seg);
+
+void route_table_create(avl_tree_t *route_table);
+void route_table_destroy(avl_tree_t *route_table);
+bool_t route_table_store(avl_tree_t *route_table, const char *filename);
 
 #ifdef	__cplusplus
 }

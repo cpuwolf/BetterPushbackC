@@ -17,10 +17,12 @@
  */
 
 #include <stddef.h>
+#include <string.h>
 
 #include <libxml/parser.h>
 #include <libxml/xpath.h>
 
+#include <acfutils/assert.h>
 #include <acfutils/helpers.h>
 
 #include "driving.h"
@@ -89,13 +91,20 @@ route_read_start_hdg(const xmlNode *point_node, xmlXPathContext *xpath_ctx)
 	xpath_obj = xmlXPathEvalExpression((xmlChar *)xpath_query, xpath_ctx);
 	if (xpath_obj == NULL || xpath_obj->nodesetval == NULL ||
 	    xpath_obj->nodesetval->nodeNr == 0) {
+		logMsg("wed2route: error determining route start_hdg: "
+		    "missing ramp start at start of route %sx%s",
+		    (char *)lat_prop, (char *)lon_prop);
 		if (xpath_obj != NULL)
 			xmlXPathFreeObject(xpath_obj);
 		return (NAN);
 	}
-	hdg_prop = xmlGetProp(xpath_obj->nodesetval->nodeTab[0], "heading");
-	if (hdg_prop == NULL || sscanf(hdg_prop, "%lf", &hdg) != 1 ||
+	hdg_prop = xmlGetProp(xpath_obj->nodesetval->nodeTab[0],
+	    (xmlChar *)"heading");
+	if (hdg_prop == NULL || sscanf((char *)hdg_prop, "%lf", &hdg) != 1 ||
 	    !is_valid_hdg(hdg)) {
+		logMsg("wed2route: error determining route start_hdg: "
+		    "missing heading tag or bad head of route %sx%s",
+		    (char *)lat_prop, (char *)lon_prop);
 		if (hdg_prop != NULL)
 			xmlFree(hdg_prop);
 		xmlXPathFreeObject(xpath_obj);
@@ -107,7 +116,7 @@ route_read_start_hdg(const xmlNode *point_node, xmlXPathContext *xpath_ctx)
 }
 
 static route_t *
-cons_route(const xmlNode *node, const avl_tree_t *objmap)
+cons_route(const xmlNode *node, const avl_tree_t *objmap, avl_tree_t *route_tbl)
 {
 	char xpath_query[128];
 	xmlXPathContext *xpath_ctx = xmlXPathNewContext(node->doc);
@@ -118,9 +127,10 @@ cons_route(const xmlNode *node, const avl_tree_t *objmap)
 	geo_pos2_t start_pos_geo = NULL_GEO_POS2;
 	vect2_t start_pos = NULL_VECT2;
 	double start_hdg = NAN;
+	list_t segs;
+	seg_t *seg;
 
-	vect2_t prev_pos = NULL_VECT2;
-	double prev_hdg = NAN;
+	list_create(&segs, sizeof (seg_t), offsetof(seg_t, node));
 
 	if (id_prop == NULL)
 		goto out;
@@ -133,12 +143,14 @@ cons_route(const xmlNode *node, const avl_tree_t *objmap)
 	if (xpath_obj == NULL)
 		goto out;
 
-	route = route_alloc(NULL, NULL);
 	for (int i = 0; i < xpath_obj->nodesetval->nodeNr; i++) {
 		const xmlNode *string_node = xpath_obj->nodesetval->nodeTab[i];
 		const xmlNode *point_node = NULL;
-		const objmap_t *vertex, srch;
+		const objmap_t *vertex;
+		objmap_t srch;
 		double lat, lon, lat_hi, lon_hi, lat_lo, lon_lo;
+		vect2_t s2e;
+		double s2e_hdg;
 
 #define	READ_PROP(var, fmt, node, propname) \
 	do { \
@@ -146,19 +158,14 @@ cons_route(const xmlNode *node, const avl_tree_t *objmap)
 		if (prop == NULL || sscanf((char *)prop, fmt, var) != 1) { \
 			if (prop != NULL) \
 				xmlFree(prop); \
-			route_free(route); \
-			route = NULL; \
 			goto out; \
 		} \
 	} while (0)
 
 		READ_PROP(&srch.id, "%llu", node, "id");
 		vertex = avl_find(objmap, &srch, NULL);
-		if (vertex == NULL) {
-			route_free(route);
-			route = NULL;
+		if (vertex == NULL)
 			goto out;
-		}
 
 		for (const xmlNode *node = string_node->children;
 		    node != NULL && node != string_node->last;
@@ -168,11 +175,8 @@ cons_route(const xmlNode *node, const avl_tree_t *objmap)
 				break;
 			}
 		}
-		if (point_node == NULL) {
-			route_free(route);
-			route = NULL;
+		if (point_node == NULL)
 			goto out;
-		}
 
 		READ_PROP(&lat, "%lf", point_node, "latitude");
 		READ_PROP(&lon, "%lf", point_node, "longitude");
@@ -186,16 +190,13 @@ cons_route(const xmlNode *node, const avl_tree_t *objmap)
 		if (IS_NULL_GEO_POS(start_pos_geo)) {
 			start_pos_geo = GEO_POS2(lat, lon);
 			start_pos = ZERO_VECT2;
-			start_hdg = route_read_start_hdg(point_node);
-			if (isnan(start_hdg)) {
-				route_free(route);
-				route = NULL;
+			start_hdg = route_read_start_hdg(point_node, xpath_ctx);
+			if (isnan(start_hdg))
 				goto out;
-			}
 			fpp = stereo_fpp_init(start_pos_geo, 0, &wgs84, B_TRUE);
 		} else {
 			geo_pos2_t end_pos_geo = GEO_POS2(lat, lon);
-			vect2_t end_pos = geo2fpp(end_pos, &fpp);
+			vect2_t end_pos = geo2fpp(end_pos_geo, &fpp);
 			double end_hdg;
 			geo_pos2_t node_pos_geo = GEO_POS2(
 			    end_pos_geo.lat + lat_lo, end_pos_geo.lon + lon_lo);
@@ -211,30 +212,63 @@ cons_route(const xmlNode *node, const avl_tree_t *objmap)
 			} else {
 				end_hdg = dir2hdg(vect2_sub(node_pos, end_pos));
 			}
+			/*
+			 * If the end_pos in the front 180-degree sector from
+			 * start_pos (in the direction of start_hdg), reverse
+			 * the end_hdg vector. This is because we only take the
+			 * ctrl_{latitude,longitude}_lo nodes into account,
+			 * which always back towards our start_pos. When backing
+			 * up, this gives the correct orientation of our nose.
+			 * However, when going forward (end_pos node ahead of
+			 * start_pos), this would point along our tail, but the
+			 * driving algorithm needs the next nose heading.
+			 */
+			s2e = vect2_sub(end_pos, start_pos);
+			s2e_hdg = dir2hdg(s2e);
+			if (fabs(rel_hdg(s2e_hdg, start_hdg)) < 90)
+				end_hdg = normalize_hdg(end_hdg + 180);
+
+			if (compute_segs(&veh, start_pos, start_hdg, end_pos,
+			    end_hdg, &segs) <= 0) {
+				logMsg("wed2route: failed to construct route: "
+				    "route too erratic");
+				goto out;
+			}
 		}
 	}
 
+	route = route_alloc(NULL, NULL);
+	for (seg = list_head(&segs); seg != NULL; seg = list_next(&segs, seg))
+		route_seg_append(route_tbl, route, seg);
+
 out:
-	if (route != NULL && avl_numnodes(&route->segs) == 0) {
+	if (route != NULL && list_head(&route->segs) == NULL) {
+		logMsg("wed2route: failed to construct route: "
+		    "too few points on route.");
 		route_free(route);
 		route = NULL;
-		goto out;
 	}
 	if (xpath_obj != NULL)
 		xmlXPathFreeObject(xpath_obj);
 	if (xpath_ctx != NULL)
 		xmlXPathFreeContext(xpath_ctx);
+	while ((seg = list_remove_head(&segs)) != NULL)
+		free(seg);
+	list_destroy(&segs);
 
 	return (route);
 }
 
 bool_t
-wed2dat(const char *earthwedxml)
+wed2dat(const char *earthwedxml, const char *route_table_filename)
 {
 	avl_tree_t *objmap = NULL;
 	xmlDoc *doc = NULL;
 	xmlXPathContext *xpath_ctx = NULL;
 	xmlXPathObject *xpath_obj = NULL;
+	avl_tree_t route_table;
+
+	route_table_create(&route_table);
 
 	doc = xmlParseFile(earthwedxml);
 	if (doc == NULL)
@@ -274,11 +308,15 @@ wed2dat(const char *earthwedxml)
 		"[@resource='pushback']]", xpath_ctx);
 	for (int i = 0; i < xpath_obj->nodesetval->nodeNr; i++) {
 		const xmlNode *node = xpath_obj->nodesetval->nodeTab[i];
-		route_t *route = cons_route(node, objmap);
+		route_t *route = cons_route(node, objmap, &route_table);
 
 		if (route == NULL)
 			goto errout;
 	}
+
+	if (!route_table_store(&route_table, route_table_filename))
+		goto errout;
+
 	xmlXPathFreeObject(xpath_obj);
 	xpath_obj = NULL;
 
@@ -293,6 +331,7 @@ wed2dat(const char *earthwedxml)
 	xmlXPathFreeObject(xpath_obj);
 	xmlXPathFreeContext(xpath_ctx);
 	xmlFreeDoc(doc);
+	route_table_destroy(&route_table);
 
 	return (B_TRUE);
 errout:
@@ -304,12 +343,13 @@ errout:
 		avl_destroy(objmap);
 		free(objmap);
 	}
-
 	if (xpath_obj != NULL)
 		xmlXPathFreeObject(xpath_obj);
 	if (xpath_ctx != NULL)
 		xmlXPathFreeContext(xpath_ctx);
 	if (doc != NULL)
 		xmlFreeDoc(doc);
+	route_table_destroy(&route_table);
+
 	return (B_FALSE);
 }
